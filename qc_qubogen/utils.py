@@ -4,7 +4,6 @@ from sympy.polys.orderings import monomial_key
 from sympy.polys.monomials import itermonomials
 
 
-
 def sort_variables(var):
     """Returns sorted variables in an alphabetical order
     """
@@ -14,7 +13,7 @@ def sort_variables(var):
     for variable in variables_list:
         variable_name = variable.name
         variable.name = variable_name.zfill(max_str_length)
-    sorted_variables = sorted(variables_list, key=lambda x: x.name)  
+    sorted_variables = sorted(variables_list, key=lambda x: x.name)
     for variable in sorted_variables:
         variable.name = variable.name.lstrip('0')
     return sorted_variables
@@ -58,9 +57,9 @@ def special_constraint(constraint, kind):
     if not all(sufficient_cond):
         return constraint, False
     
-    condition_eq_1_2 = [any([length == 3, length == 4]), 
+    condition_eq_1_2 = [any([length == 3, length == 4]),
                         kind == 'lt',
-                        all(coeff==1 for coeff in constraint_as_dict.values()), 
+                        all(coeff==1 for coeff in constraint_as_dict.values()),
                         constant==-1]
     condition_eq_3_4 = [length == 2,
                         any([kind=='eq', kind=='lt']),
@@ -74,29 +73,29 @@ def special_constraint(constraint, kind):
     ### x + y <= 1, x + y + z <= 1
     if all(condition_eq_1_2):
         var_combinations = sorted(
-            itermonomials(list(constraint.free_symbols), 2), 
+            itermonomials(list(constraint.free_symbols), 2),
             key=monomial_key('lex', list(constraint.free_symbols))
         )
         new_constraint = sum([
-            func for func in var_combinations 
+            func for func in var_combinations
             if (not func.is_integer) and Poly(func).is_multivariate
         ])
         return new_constraint, True
     ### x <= y , x = y
     elif all(condition_eq_3_4):
         if kind == 'lt':
-            new_constraint = [var for var, coeff in constraint_as_dict.items() 
+            new_constraint = [var for var, coeff in constraint_as_dict.items()
                                if coeff==-1][0]
             var_combinations = sorted(
-                itermonomials(list(constraint.free_symbols), 2), 
+                itermonomials(list(constraint.free_symbols), 2),
                 key=monomial_key('lex', list(constraint.free_symbols))
             )
-            new_constraint -= [term for term in var_combinations 
+            new_constraint -= [term for term in var_combinations
                                 if term.is_Mul][0]
             return new_constraint, True
         if kind == 'eq' :
             var_combinations = sorted(
-                itermonomials(list(constraint.free_symbols), 2), 
+                itermonomials(list(constraint.free_symbols), 2),
                 key=monomial_key('lex', list(constraint.free_symbols))
             )
             new_constraint = 0
@@ -104,12 +103,12 @@ def special_constraint(constraint, kind):
                 if term.is_symbol:
                     new_constraint += term
                 elif term.is_Mul:
-                    new_constraint -= 2*term 
+                    new_constraint -= 2*term
         return new_constraint, True
     ### x + y >= 1, x + y = 1
     if all(condition_eq_5_6):
         var_combinations = sorted(
-            itermonomials(list(constraint.free_symbols), 2), 
+            itermonomials(list(constraint.free_symbols), 2),
             key=monomial_key('lex', list(constraint.free_symbols))
         )
         new_constraint = 0
@@ -117,7 +116,7 @@ def special_constraint(constraint, kind):
             if term.is_integer or term.is_Mul:
                 new_constraint += term
             if term.is_Mul and kind=='eq':
-                new_constraint += term 
+                new_constraint += term
             if term.is_symbol and kind=='gt':
                 new_constraint -= term
             if term.is_symbol and kind == 'eq':
@@ -127,7 +126,7 @@ def special_constraint(constraint, kind):
     return constraint, False
 
 def penalty_symbols_as_set(penalties_array):
-    """Return the penalties as a set 
+    """Return the penalties as a set
     """
     penalties = set()
     for p in penalties_array:
@@ -153,18 +152,11 @@ def simplify(polynom):
 
     for var_i in variables:
         coefficient_i = polynom.as_expr().coeff(var_i)/2
-        for degree in range(polynom.degree()-1):
-            coefficient_i += polynom.as_expr().coeff(var_i ** (degree+2))
-        if coefficient_i.is_Float:
-            new_polynom += float(coefficient_i) * var_i
-        else:
-            new_polynom += float(coefficient_i.as_coefficients_dict()[1]) * var_i
+        coefficient_i += polynom.as_expr().coeff(var_i ** 2)
+        new_polynom += coefficient_i.as_coefficients_dict()[1] * var_i
         for var_j in variables:
             if var_j != var_i:
                 coefficient_j = coefficient_i.coeff(var_j)
-                if coefficient_j.is_Float:
-                    new_polynom += float(coefficient_j) * var_i * var_j
-                else:
-                    new_polynom += float(coefficient_j.as_coefficients_dict()[1]) * var_i * var_j
+                new_polynom += coefficient_j.as_coefficients_dict()[1] *\
+                                    var_i * var_j
     return new_polynom + polynom.as_expr().as_coefficients_dict()[1]
-

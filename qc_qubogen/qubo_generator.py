@@ -1,49 +1,139 @@
-"""This module contains the QUBO Generator, which transforms constrained 
-optimization problems into a QUBO Problem by given objective function 
-and constraints. Also it computes the final QUBO matrix, 
+"""This module contains the QUBO Generator, which transforms constrained
+optimization problems into a QUBO Problem by given objective function
+and constraints. Also it computes the final QUBO matrix,
 which contains all the informations of the problem.
 """
 import math
 import warnings
-from copy import deepcopy
-
 import numpy as np
-from sympy import Poly, Symbol
 
-from .utils import *
+from copy import deepcopy
+from sympy import Poly, Symbol, Float, expand
+from .utils import sort_variables, special_constraint
+from .utils import penalty_symbols_as_set, subs_matrix
+from tqdm import tqdm
+    
+    
+    
+def _compute_minimum(cons):
+    """The lower bound of the constraint, which is either the estimated minimum
+    of the constraint or given by bounds.
+    """
+    minimum = sum(
+        coeff for var, coeff in cons.constraint.as_coefficients_dict().items()
+        if coeff<0 and var != 1
+    )
+    if cons.bounds is None or cons.bounds[0] is None:
+        return minimum
+    if cons.bounds[0] < minimum:
+        warnings.warn(
+            "The lower bound is smaller than the estimated minimum of "
+            "the constraint. Therefore the lower bound is ignored."
+        )
+        return minimum
+    return cons.bounds[0]
+    
 
+def _compute_slack(cons):
+    """The slack, which will be added to the constraint
+    """
+    maximum = -1 * float(cons.constraint.as_coefficients_dict()[1])
+    if cons.kind == 'eq' or cons.special:
+        return None
+    if cons.bounds is not None and cons.bounds[1] is not None:
+        if cons.bounds[1] > maximum:
+            warnings.warn(
+                "The upper bound is higher than the right hand side of "
+                "the constraint (constant). Therefore the upper bound is ignored."
+            )
+        else:
+            maximum = cons.bounds[1]
+    slack_var= maximum - cons.minimum
+    if slack_var < 0:
+        warnings.warn(
+            "The constraint can not be fulfilled. Therefore the constraint will "
+            "not be added. Reason is either the right hand side of the constraint "
+            "(constant) or the bounds, if added."
+        )
+        return 400
+    if slack_var == 0:
+        return None
+    else:
+        num_slack = int(math.log(math.ceil(slack_var), 2)) + 1
+
+        coeff = np.array([2**i for i in range(num_slack)])
+        slack_symbols = get_symbolic_binary_variables(
+                            num_slack, 
+                            cons.slack_variables_start_idx
+                        )
+        if cons.kind == 'gt':
+            return - (slack_symbols @ coeff)
+        return slack_symbols @ coeff
 
 
 def get_symbolic_binary_variables(n, start_idx=0):
-    """Returns a list of 'n' (int) symbolic binary variables, 
-    i.e. a list of sympy.Symbol 
+    """Returns a list of 'n' (int) symbolic binary variables,
+    i.e. a list of sympy.Symbol
     """
     return [Symbol(f"x{i+start_idx}") for i in range(n)]
+
+
+def from_matrix_to_qubo(matrix):
+    """This method transforms a matrix to a QUBOModel Object
+
+    Parameters
+    ----------
+    matrix : list, numpy array
+        QUBO Matrix
+
+    Returns
+    -------
+    QUBOModel
+        Object QUBOModel from the given QUBO Matrix
+    """
+    if not np.array_equal(np.array(matrix), np.array(matrix).T):
+        raise ValueError(
+            "The matrix is not quadratic, therefore cannot be "
+            "transformed into a QUBO Model"
+        )
+    symbolic_var = get_symbolic_binary_variables(len(matrix))
+    poly_model = symbolic_var @ np.array(matrix) @ symbolic_var
+    return QUBOModel(poly_model)
+    
+    
+def _compute_variables(polynom):
+    """compute variables of a polynom
+    """
+    if not isinstance(polynom, (int, float)) and polynom is not None:
+        return polynom.free_symbols
+    return set()
 
 
 
 class Constraint:
     def __init__(self, constraint, kind, penalty, slack_variables_start_idx=None,
                 bounds = None, special=False):
-        """Constaint object with some properties
+        """Constraint object with some properties
 
         Parameters
         ----------
         constraint : sympy.core.expr.Expr or subclasses
             a constraint of the QUBO model
         kind : 'str'
-            kind of constraint. 'lt' (less or equal than), 'gt' (greater or equal than)
-            or equal constraint
+            kind of constraint. 'lt' (less or equal than), 'gt' (greater or 
+            equal than) or equal constraint
         penalty : int or float
             panlty factor, which will be multiplied with the constraint
         slack_variables_start_idx : int, optional
             the amount of slack variables used before this constraint was added
             to the model, by default None
         bounds : tuple or list, optional
-            should be of length 2 and gives the boundary of the constraint, by default None
+            should be of length 2 and gives the boundary of the constraint, 
+            by default None
         special : bool, optional
-            the special constraints can be found in the paper "A Tutorial on Formulating
-            and Using QUBO Models" by Fred Glover, Gary Kochenberger, Yu Du. By default False
+            the special constraints can be found in the paper "A Tutorial on 
+            Formulating and Using QUBO Models" by Fred Glover, 
+            Gary Kochenberger, Yu Du. By default False
         """
         self.constraint = constraint
         self.constraint_without_slack = constraint
@@ -52,7 +142,11 @@ class Constraint:
         self.kind = kind
         self.bounds = bounds
         self.slack_variables_start_idx = slack_variables_start_idx
-        
+        self.minimum = _compute_minimum(self)
+        self.slack = _compute_slack(self)
+        self.variables = _compute_variables(self.constraint)
+        self.slack_variables = _compute_variables(self.slack)
+        self.binary_variables = self.variables.difference(self.slack_variables)
 
     @property
     def bounds(self):
@@ -64,83 +158,16 @@ class Constraint:
         if bounds is None:
             self._bounds = None
         elif not isinstance(bounds, (tuple, list, np.ndarray)) and len(bounds)==2:
-            raise ValueError('bounds must be a tuple, list or np.ndarray of length 2')
+            raise ValueError(
+                'bounds must be a tuple, list or np.ndarray of length 2'
+            )
         else:
             self._bounds = bounds
             
-
-    @property
-    def variables(self):
-        if self.constraint != 0:
-            return self.constraint.free_symbols
-        return set()
-    
-
+            
     @property
     def num_variables(self):
         return len(self.variables)
-    
-
-    @property
-    def minimum(self):
-        """The lower bound of the constraint, which is either the estimated minimum
-        of the constraint or given by bounds.
-        """
-        minimum = sum(
-            coeff for var, coeff in self.constraint.as_coefficients_dict().items()
-            if coeff<0 and var != 1
-        )
-        if self.bounds is None or self.bounds[0] is None:
-            return minimum
-        if self.bounds[0] < minimum:
-            warnings.warn(
-                "The lower bound is smaller than the estimated minimum of "
-                "the constraint. Therefore the lower bound is ignored."
-            )
-            return minimum
-        return self.bounds[0]
-    
-
-    @property
-    def slack(self):
-        """The slack, which will be added to the constraint
-        """
-        maximum = -1 * float(self.constraint.as_coefficients_dict()[1])
-        if self.kind == 'eq' or self.special:
-            return None
-        if self.bounds is not None and self.bounds[1] is not None:
-            if self.bounds[1] > maximum:
-                warnings.warn(
-                    "The upper bound is higher than the right hand side of "
-                    "the constraint (constant). Therefore the upper bound is ignored."
-                )
-            else:
-                maximum = self.bounds[1]
-        slack_var= maximum - self.minimum
-        if slack_var < 0:
-            warnings.warn(
-                "The constraint can not be fulfilled. Therefore the constraint will "
-                "not be added. Reason is either the right hand side of the constraint "
-                "(constant) or the bounds, if added."
-            )
-            return 400
-        if slack_var == 0:
-            return None
-        else:
-            num_slack = int(math.log(math.ceil(slack_var), 2)) + 1
-
-            coeff = np.array([2**i for i in range(num_slack)])
-            slack_symbols = get_symbolic_binary_variables(num_slack, self.slack_variables_start_idx)
-            if self.kind == 'gt':
-                return - (slack_symbols @ coeff)
-            return slack_symbols @ coeff
-        
-
-    @property
-    def slack_variables(self):
-        if self.slack is not None and self.slack != 400:
-            return self.slack.free_symbols
-        return None
     
 
     @property
@@ -152,9 +179,9 @@ class Constraint:
     def offset(self):
         """The constant in the constraint
         """
-        if self.constraint != 0:
+        if not isinstance(self.constraint, (int, float)):
             return float(self.constraint.as_expr().as_coefficients_dict()[1])
-        return 0
+        return self.constraint
     
 
     def __len__(self):
@@ -166,55 +193,47 @@ class Constraint:
 
 
 
-class QUBOModel:   
-    def __init__(self, model=0):
-        """
+class QUBOModel:
+    def __init__(self, model):
+        """Contains all information to transform a function into a QUBO Matrix.
 
         Parameters
         ----------
         model : sympy.core.expr.Expr or subclasses
             should have as input the objective function
+
+        Raises
+        ------
+        ValueError
+            if the model (polynom) is not a quadratic function, 
+            i.e. at most degree 2.
+            
         """
-        self.poly_model = model
+        if not isinstance(model, (int, float)):
+            if Poly(model).is_quadratic:
+                self.poly_model = model
+            else:
+                raise ValueError(
+                    "Only quadratic functions are allowed es input"
+                )
+        else:
+            self.poly_model = model
+            
         self.objective_function = deepcopy(model)
         self.constraints = []
         self.penalties = []
         self.qubo_matrix = None
         self.slacks = []
-        
-
-    @property
-    def poly_model(self):
-        """The function, which will be transformed into a qubo_matrix
-        """
-        return self._poly_model
-    
-
-    @poly_model.setter
-    def poly_model(self, polynom):
-        if isinstance(polynom, (int, float)):
-            self._poly_model = polynom
-        elif not Poly(polynom).is_quadratic:
-            raise ValueError(
-                "The poly_model is not quadratic and therefore "
-                "cannot be transformed into a QUBO."
-            )
-        else:
-            self._poly_model = Poly(polynom)
+        self.binary_variables = _compute_variables(self.objective_function)
+        self.slack_variables = set()
             
 
     @property
     def variables(self):
         """Set of variables in the QUBOModel Object
         """
-        if not isinstance(self.poly_model, (int, float)):
-            variables = self.poly_model.free_symbols
-            penalties = penalty_symbols_as_set(self.penalties)
-            if penalties:
-                return variables.difference(penalties)
-            return variables
-        return set()
-    
+        return self.binary_variables.union(self.slack_variables)
+
 
     @property
     def num_variables(self):
@@ -222,39 +241,8 @@ class QUBOModel:
     
 
     @property
-    def binary_variables(self):
-        """Set of variables, without slack variables
-        """
-        binary_variables_temp = set()
-        if self.objective_function != 0:
-            binary_variables_temp = binary_variables_temp.union(
-                                        self.objective_function.free_symbols)
-        if not np.array(self.constraints).all():
-            for cons in self.constraints:
-                if cons is not None:
-                    binary_variables_temp = binary_variables_temp.union(cons.variables)
-            penalties = penalty_symbols_as_set(self.penalties)
-            if penalties:
-                return binary_variables_temp.difference(penalties)
-            return binary_variables_temp
-        return binary_variables_temp
-    
-
-    @property
     def num_binary_variables(self):
         return len(self.binary_variables)
-    
-
-    @property
-    def slack_variables(self):
-        if not np.array(self.slacks).all():
-            return set()
-
-        slack_variables_temp = set()
-        for slack_cons in self.slacks:
-            if slack_cons is not None:
-                slack_variables_temp = slack_variables_temp.union(slack_cons.free_symbols)
-        return slack_variables_temp
     
 
     @property
@@ -264,18 +252,21 @@ class QUBOModel:
 
     @property
     def offset(self):
-        """The constant in the poly_model, which will not be considered in the qubo_matrix
+        """The constant in the poly_model, which will not be considered 
+        in the qubo_matrix
         """
-        if self.poly_model != 0:
-            return float(self._poly_model.as_expr().as_coefficients_dict()[1])
-        return 0
+        if not isinstance(self.poly_model, (int, float)):
+            return float(self.poly_model.as_expr().as_coefficients_dict()[1])
+        return self.poly_model
     
 
     @property
     def offset_objective_function(self):
-        if self.objective_function != 0:
-            return float(self.objective_function.as_expr().as_coefficients_dict()[1])
-        return 0
+        if not isinstance(self.objective_function, (int,float)):
+            return float(
+                self.objective_function.as_expr().as_coefficients_dict()[1]
+                )
+        return self.objective_function
     
 
     def __len__(self):
@@ -287,7 +278,7 @@ class QUBOModel:
 
 
     def model_to_qubo(self, return_offset=False):
-        """Transforms the QUBO Model into a Matrix,
+        """Transforms the QUBO Model into a matrix,
         which can be used as an input for various solver
 
         Returns
@@ -296,50 +287,39 @@ class QUBOModel:
             QUBO Matrix of the model.
         """
         if isinstance(self.poly_model, (float, int)):
-            return 0
+            self.qubo_matrix = 0
+            if return_offset:
+                return self.qubo_matrix, self.offset
+            return self.qubo_matrix
         penalties = penalty_symbols_as_set(self.penalties)
-        variables = sort_variables(self.variables.difference(penalties))
-        
         if penalties:
-            matrix = np.zeros((self.num_variables, self.num_variables), dtype=object)
+            matrix = np.zeros(
+                (self.num_variables, self.num_variables), dtype=object)
         else:
             matrix = np.zeros((self.num_variables, self.num_variables))
-
-        for var_i_index, var_i in enumerate(variables):
+        self.poly_model = expand(self.poly_model)
+        variables = sort_variables(self.variables)
+        for var_i_index, var_i in enumerate(tqdm(variables)):
             coefficient_i = self.poly_model.as_expr().coeff(var_i)
-            for degree in range(self.poly_model.degree()-1):
-                coefficient_i += self.poly_model.as_expr().coeff(var_i ** (degree+2))
-            if coefficient_i.is_Float:
-                matrix[(var_i_index, var_i_index)] = float(coefficient_i)
-            elif coefficient_i.free_symbols.issubset(penalties):
-                matrix[(var_i_index, var_i_index)] = coefficient_i
-            else:
-                matrix[(var_i_index, var_i_index)] = float(
-                    coefficient_i.as_coefficients_dict()[1]
-                )
+            coefficient_i += self.poly_model.as_expr().coeff(var_i ** 2)
+            matrix[(var_i_index, var_i_index)] = float(
+                coefficient_i.as_coefficients_dict()[1]
+            )
+            if penalties:
+                for penalty in penalties:
+                    matrix[(var_i_index, var_i_index)] += penalty *\
+                        coefficient_i.coeff(penalty).as_coefficients_dict()[1]
+                    
             for var_j_index, var_j in enumerate(variables):
                 if var_j != var_i:
                     coefficient_j = coefficient_i.coeff(var_j)
-                    if coefficient_j.is_Float:
-                        matrix[(var_i_index, var_j_index)] = float(coefficient_j)/2
-                        matrix[(var_j_index, var_i_index)] = float(coefficient_j)/2
-                    elif coefficient_j.free_symbols.issubset(penalties):
-                        matrix[(var_i_index, var_j_index)] = coefficient_j/2
-                        matrix[(var_j_index, var_i_index)] = coefficient_j/2
-                    else:
-                        matrix[(var_i_index, var_j_index)] = float(
-                            coefficient_j.as_coefficients_dict()[1]
-                        )/2
-                        matrix[(var_j_index, var_i_index)] = float(
-                            coefficient_j.as_coefficients_dict()[1]
-                        )/2
-
+                    matrix[(var_i_index, var_j_index)] += coefficient_j * 0.5
         self.qubo_matrix = matrix
         if return_offset:
             return self.qubo_matrix, self.offset
         return matrix
-
-
+    
+    
     def add_constraint(self, constraint, kind, penalty=None, bounds=None):
         """Adds Constraint to the objective function or the model.
         If a less than or greater than constraint is added, the corresponding
@@ -351,10 +331,10 @@ class QUBOModel:
         constraint : sympy
             constraint, which should be added to the objective function
         kind : string
-            'eq' (equal), 'gt' (greater or equal than) or 'lt' 
+            'eq' (equal), 'gt' (greater or equal than) or 'lt'
             (less or equal than) (in)equality
         penalty : float or symbol, optional
-            Penalty factor for the constraint, 
+            Penalty factor for the constraint,
             by default: upper - lower bound of the constraint
         bounds : tuple, optional
             lower and upper bound for the constraint, by default None
@@ -367,7 +347,7 @@ class QUBOModel:
         Raises
         ------
         ValueError
-            is raised if the constraint is not linear. 
+            is raised if the constraint is not linear.
             Otherwise it cannot transformed into a QUBO
         NameError
             is raised if neither of the kinds above is given for kind
@@ -377,10 +357,10 @@ class QUBOModel:
                 "The Constraint is not linear and therefore it "
                 "cannot be transformed into a QUBO"
             )
-
         if penalty is None:
-            penalty = sum([abs(coef) for coef in Poly(constraint).coeffs()])
-
+            penalty = Float(sum([abs(coef) 
+                        for coef in Poly(constraint).coeffs()]))
+            
         constraint, special = special_constraint(constraint, kind)
         if special or kind =='eq':
             if bounds is not None:
@@ -390,13 +370,19 @@ class QUBOModel:
                 )
             if kind == 'eq':
                 cons = Constraint(constraint, kind, penalty)
-                self.poly_model = self.poly_model + cons.penalty * cons.constraint**2
+                self.poly_model = self.poly_model +\
+                                    cons.penalty * cons.constraint**2
             cons = Constraint(constraint, kind, penalty, special)
             self.poly_model = self.poly_model + cons.penalty * cons.constraint
-
             self.constraints = np.append(self.constraints, cons)
             self.slacks = np.append(self.slacks,cons.slack)
             self.penalties = np.append(self.penalties, cons.penalty)
+            self.binary_variables = self.binary_variables.union(
+                                        cons.binary_variables
+                                    )
+            self.slack_variables = self.slack_variables.union(
+                                        cons.slack_variables
+                                    )
             return cons
 
         elif kind in ('lt', 'gt'):
@@ -404,39 +390,52 @@ class QUBOModel:
                 constraint = -1 * constraint
             if bounds is None:
                 cons = Constraint(
-                    constraint, 
-                    kind, 
+                    constraint,
+                    kind,
                     penalty,
                     slack_variables_start_idx=self.num_variables
                 )
             else:
                 cons = Constraint(
-                    constraint, 
-                    kind, 
+                    constraint,
+                    kind,
                     penalty,
-                    slack_variables_start_idx=self.num_variables, 
+                    slack_variables_start_idx=self.num_variables,
                     bounds=bounds
                 )
-
+      
             if cons.slack == 400:
                 return self.poly_model
             if cons.slack == 0:
                 warnings.warn('The constraint is an equation')
-                self.poly_model = self.poly_model + cons.penalty * cons.constraint**2
+                self.poly_model = self.poly_model +\
+                                    cons.penalty * cons.constraint**2
                 self.slacks = np.append(self.slacks, cons.slack)
                 self.constraints = np.append(self.constraints, cons)
                 self.penalties = np.append(self.penalties, cons.penalty)
+                self.binary_variables = self.binary_variables.union(
+                                            cons.binary_variables
+                                        )
+                self.slack_variables = self.slack_variables.union(
+                                            cons.slack_variables
+                                        )
                 return cons
-
             if kind == 'gt':
                 cons.constraint -= cons.slack
             else:
                 cons.constraint += cons.slack
-
+        
             self.constraints = np.append(self.constraints, cons)
-            self.poly_model = self.poly_model + penalty * (cons.constraint ** 2)
+            self.poly_model = self.poly_model +\
+                                cons.penalty * (cons.constraint ** 2)
             self.slacks = np.append(self.slacks, cons.slack)
             self.penalties = np.append(self.penalties, cons.penalty)
+            self.binary_variables = self.binary_variables.union(
+                                        cons.binary_variables
+                                    )
+            self.slack_variables = self.slack_variables.union(
+                                        cons.slack_variables
+                                    )
             return cons
         else:
             raise NameError('Unknown kind of inequality')
@@ -464,10 +463,13 @@ class QUBOModel:
         """
         if any(bit != 0 or bit != 1 for bit in bitstring):
             raise ValueError("bitstring must only of 0 and 1s")
-        if not (self.num_binary_variables == len(bitstring) or self.num_variables == len(bitstring)):
-            raise ValueError("The shape of the solution and the model does not fit.")
-        return bitstring @ self.qubo_matrix[0:len(bitstring), 0:len(bitstring)] @ bitstring \
-                + self.offset_objective_function
+        if not (self.num_binary_variables == len(bitstring) 
+                or self.num_variables == len(bitstring)):
+            raise ValueError(
+                "The shape of the solution and the model does not fit."
+            )
+        return bitstring @ self.qubo_matrix[0:len(bitstring), 
+                0:len(bitstring)] @ bitstring + self.offset_objective_function
 
 
     def evaluate_model(self, bitstring):
@@ -486,13 +488,16 @@ class QUBOModel:
         Raises
         ------
         ValueError
-            if the length of bitstring is not the same as the amount of variables of the model
-            if bitstring has an element, which is non zero or not one
+            if the length of bitstring is not the same as the amount of 
+            variables of the model if bitstring has an element, which is 
+            non zero or not one
         """
         if any(bit != 0 or bit != 1 for bit in bitstring):
             raise ValueError("bitstring must only of 0 and 1s")
         if self.num_variables != len(bitstring):
-            raise ValueError("The shape of the solution and the model does not fit")
+            raise ValueError(
+                "The shape of the solution and the model does not fit"
+            )
         return bitstring @ self.qubo_matrix @ bitstring + self.offset
     
 
@@ -527,32 +532,12 @@ class QUBOModel:
         QUBOModel_copy.poly_model = QUBOModel_copy.poly_model.subs(input)
         for i, penalty in enumerate(QUBOModel_copy.penalties):
             if isinstance(penalty, Symbol):
-                QUBOModel_copy.penalties[i] = QUBOModel_copy.penalties[i].subs(input)
+                QUBOModel_copy.penalties[i] = QUBOModel_copy.penalties[i].subs(
+                                                input
+                                              )
         if QUBOModel_copy.qubo_matrix is not None:
-            QUBOModel_copy.qubo_matrix = subs_matrix(QUBOModel_copy.qubo_matrix, input)
+            QUBOModel_copy.qubo_matrix = subs_matrix(
+                                            QUBOModel_copy.qubo_matrix, input
+                                         )
             QUBOModel_copy.qubo_matrix.astype('float')
         return QUBOModel_copy
-
-
-
-def from_matrix_to_qubo(matrix):
-    """This method transforms a matrix to a QUBOModel Object
-
-    Parameters
-    ----------
-    matrix : list, numpy array
-        QUBO Matrix
-
-    Returns
-    -------
-    QUBOModel
-        Object QUBOModel from the given QUBO Matrix
-    """
-    if not np.array_equal(np.array(matrix), np.array(matrix).T):
-        raise ValueError(
-            "The matrix is not quadratic, therefore cannot be "
-            "transformed into a QUBO Model"
-        )
-    symbolic_var = get_symbolic_binary_variables(len(matrix))
-    poly_model = symbolic_var @ np.array(matrix) @ symbolic_var
-    return QUBOModel(poly_model)
